@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shopping List</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>GenAI Shopping List</h1>
+
+    <form id="add-item-form">
+        <input type="text" id="item-input" placeholder="Food Item" required>
+        <input type="text" id="quantity-input" placeholder="Quantity (e.g., 1kg, 2 packs)" required>
+        <button type="submit">Add Item</button>
+    </form>
+
+    <h2>Items to Buy:</h2>
+    <ul id="item-list">
+        <!-- Items will be loaded here by JavaScript -->
+        <li>Loading...</li>
+    </ul>
+
+    <script src="script.js"></script>
+</body>
+</html>

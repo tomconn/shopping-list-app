@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  # Backend Go Application
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: shopping-list-backend
+    restart: unless-stopped
+    environment:
+      # Match these with PostgreSQL service env vars
+      - DB_HOST=db         # Service name of the database container
+      - DB_PORT=5432
+      - DB_USER=shopping_user
+      - DB_PASSWORD=verysecurepassword # Use secrets in production!
+      - DB_NAME=shopping_list_db
+      - DB_SSLMODE=disable # Change to 'require' etc. if using SSL
+      - APP_PORT=8080      # Port the Go app listens on *inside* the container
+      - APP_ENV=production # Set to production to avoid loading .env
+    networks:
+      - app-network
+    depends_on:
+      db:
+        condition: service_healthy # Wait for DB to be ready
+
+  # Frontend Nginx Server
+  frontend:
+    image: nginx:1.25-alpine # Use a specific recent version
+    container_name: shopping-list-frontend
+    restart: unless-stopped
+    ports:
+      - "8081:80" # Map host port 8081 to container port 80 (Nginx default)
+                  # Access via http://localhost:8081 from your browser
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro # Mount frontend code read-only
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro # Mount nginx config read-only
+    networks:
+      - app-network
+    depends_on:
+      - backend # Ensure backend starts before frontend tries to proxy to it
+
+  # PostgreSQL Database
+  db:
+    image: postgres:16-alpine # Use PostgreSQL 16
+    container_name: shopping-list-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=shopping_user
+      - POSTGRES_PASSWORD=verysecurepassword # MUST match backend DB_PASSWORD
+      - POSTGRES_DB=shopping_list_db         # MUST match backend DB_NAME
+    volumes:
+      - postgres_data:/var/lib/postgresql/data # Persist database data
+    networks:
+      - app-network
+    ports:
+      - "5433:5432" # Optional: Map host port 5433 to container port 5432 for external DB tools
+                    # Do not rely on this for app communication; use service name 'db'
+    healthcheck:
+        # Check if Postgres is ready to accept connections
+        test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+        start_period: 10s # Give postgres time to start up initially
+
+networks:
+  app-network:
+    driver: bridge # Default network driver
+
+volumes:
+  postgres_data: # Define the named volume for data persistence
+    driver: local

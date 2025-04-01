@@ -1,0 +1,16 @@
+# Go build output
+shopping-list-backend
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE specific files (add your IDE's if needed)
+.idea/
+.vscode/
+
+# Secrets or local config (if you add any later)
+# .env
+
+# Zip file if created inside the project dir
+*.zip
