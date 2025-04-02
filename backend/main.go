@@ -2,9 +2,10 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
+	"errors" // Keep for sql.ErrNoRows check if needed, though pgx might have its own ErrNoRows
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"        // Needed for DBPool interface method signatures
+	"github.com/jackc/pgx/v5/pgconn" // Needed for DBPool interface method signatures
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv" // Optional: For local .env loading
 )
@@ -36,12 +39,26 @@ type Item struct {
 	CreatedAt time.Time `json:"created_at,omitempty"` // omitempty for POST
 }
 
+// --- Interface for DB Operations ---
+
+// DBPool defines the interface for database operations we need,
+// allowing both real pgxpool.Pool and mocks to be used.
+type DBPool interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Ping(ctx context.Context) error
+	Close() // Required for graceful shutdown and test cleanup
+}
+
 // --- Global Variables ---
-var dbpool *pgxpool.Pool
+// Use the interface type for the global variable
+var dbpool DBPool
 
 // --- Database Functions ---
 
 // connectDB initializes the database connection pool
+// It still returns the concrete type *pgxpool.Pool, which implements DBPool
 func connectDB(cfg DBConfig) (*pgxpool.Pool, error) {
 	connString := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s pool_max_conns=10",
 		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.DBName, cfg.SSLMode)
@@ -73,7 +90,8 @@ func connectDB(cfg DBConfig) (*pgxpool.Pool, error) {
 }
 
 // createSchemaIfNotExists checks for the items table and creates it if it doesn't exist
-func createSchemaIfNotExists(pool *pgxpool.Pool) error {
+// Accepts the DBPool interface type
+func createSchemaIfNotExists(pool DBPool) error {
 	createTableSQL := `
 	CREATE TABLE IF NOT EXISTS items (
 		id SERIAL PRIMARY KEY,
@@ -91,12 +109,13 @@ func createSchemaIfNotExists(pool *pgxpool.Pool) error {
 }
 
 // getItems retrieves all items from the database
+// Uses the global dbpool (which is of type DBPool)
 func getItems(ctx context.Context) ([]Item, error) {
 	rows, err := dbpool.Query(ctx, "SELECT id, name, quantity, created_at FROM items ORDER BY created_at DESC")
 	if err != nil {
-		// If no rows are found, return an empty slice, not an error
-		if err == sql.ErrNoRows { // Note: pgx might return pgx.ErrNoRows, check specific error if needed
-			return []Item{}, nil
+		// Check specifically for pgx's no rows error if necessary, otherwise treat as general DB error
+		if errors.Is(err, pgx.ErrNoRows) {
+			return []Item{}, nil // Return empty slice for no rows, not an error
 		}
 		log.Printf("Error querying items: %v\n", err)
 		return nil, fmt.Errorf("database query error: %w", err)
@@ -104,13 +123,13 @@ func getItems(ctx context.Context) ([]Item, error) {
 	defer rows.Close()
 
 	items := []Item{}
+	// Use pgx's CollectRows or Next/Scan loop
 	for rows.Next() {
 		var item Item
 		if err := rows.Scan(&item.ID, &item.Name, &item.Quantity, &item.CreatedAt); err != nil {
 			log.Printf("Error scanning item row: %v\n", err)
-			// Decide whether to skip this row or return an error
-			// For robustness, potentially skip and log
-			continue // Skip this item if scanning fails
+			// Continue processing other rows if one fails to scan
+			continue
 		}
 		items = append(items, item)
 	}
@@ -118,6 +137,8 @@ func getItems(ctx context.Context) ([]Item, error) {
 	// Check for errors from iterating over rows.
 	if err := rows.Err(); err != nil {
 		log.Printf("Error after iterating rows: %v\n", err)
+		// It's often better to return the items successfully scanned along with the iteration error
+		// But for simplicity here, we return an error indicating partial results might be lost.
 		return nil, fmt.Errorf("database iteration error: %w", err)
 	}
 
@@ -126,6 +147,7 @@ func getItems(ctx context.Context) ([]Item, error) {
 
 // addItem inserts a new item into the database
 // Uses parameterized queries to prevent SQL injection.
+// Uses the global dbpool (DBPool interface)
 func addItem(ctx context.Context, newItem Item) (Item, error) {
 	// Basic validation (could be more extensive)
 	if strings.TrimSpace(newItem.Name) == "" || strings.TrimSpace(newItem.Quantity) == "" {
@@ -134,6 +156,7 @@ func addItem(ctx context.Context, newItem Item) (Item, error) {
 
 	var insertedID int
 	var createdAt time.Time
+	// Use QueryRow method from the DBPool interface
 	err := dbpool.QueryRow(ctx,
 		"INSERT INTO items (name, quantity) VALUES ($1, $2) RETURNING id, created_at",
 		newItem.Name, newItem.Quantity, // Parameters are handled safely by pgx
@@ -152,7 +175,9 @@ func addItem(ctx context.Context, newItem Item) (Item, error) {
 
 // deleteItem removes an item from the database by ID
 // Uses parameterized queries.
+// Uses the global dbpool (DBPool interface)
 func deleteItem(ctx context.Context, id int) error {
+	// Use Exec method from the DBPool interface
 	cmdTag, err := dbpool.Exec(ctx, "DELETE FROM items WHERE id = $1", id)
 	if err != nil {
 		log.Printf("Error deleting item with ID %d: %v\n", id, err)
@@ -160,14 +185,15 @@ func deleteItem(ctx context.Context, id int) error {
 	}
 	if cmdTag.RowsAffected() == 0 {
 		log.Printf("Attempted to delete non-existent item with ID %d\n", id)
-		// Consider returning a specific error like ErrNotFound if needed by the frontend
-		return fmt.Errorf("item with ID %d not found", id) // Or return nil if "not found" isn't an error case here
+		// Return a distinct error for not found if needed by caller
+		return fmt.Errorf("item with ID %d not found", id)
 	}
 	log.Printf("Deleted item with ID %d\n", id)
 	return nil
 }
 
 // --- HTTP Handlers ---
+// Handlers remain the same, they internally call the DB functions which now use the interface
 
 func itemsHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -181,9 +207,25 @@ func itemsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func itemDetailHandler(w http.ResponseWriter, r *http.Request) {
+	// Extract ID from URL path like /api/items/123
+	// Ensure path ends with the ID and not just /items/
+	pathParts := strings.Split(strings.TrimSuffix(r.URL.Path, "/"), "/")
+	if len(pathParts) < 3 || pathParts[len(pathParts)-1] == "" || pathParts[len(pathParts)-2] != "items" {
+		http.Error(w, "Bad Request: Invalid URL format or missing item ID", http.StatusBadRequest)
+		return
+	}
+	idStr := pathParts[len(pathParts)-1]
+
+	id, err := strconv.Atoi(idStr)
+	if err != nil || id <= 0 {
+		http.Error(w, "Bad Request: Invalid item ID format", http.StatusBadRequest)
+		return
+	}
+
+	// Now handle the method
 	switch r.Method {
 	case http.MethodDelete:
-		deleteItemHandler(w, r)
+		deleteItemHandler(w, r, id) // Pass the parsed ID
 	default:
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 	}
@@ -205,8 +247,7 @@ func getItemsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(items); err != nil {
 		log.Printf("Error encoding items to JSON: %v", err)
-		// Don't write header again if already written by Encode
-		// http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		// Avoid writing header again if already written by Encode
 	}
 }
 
@@ -219,24 +260,42 @@ func addItemHandler(w http.ResponseWriter, r *http.Request) {
 	dec.DisallowUnknownFields() // Prevent extra fields in JSON
 
 	if err := dec.Decode(&newItem); err != nil {
-		log.Printf("Error decoding JSON body: %v", err)
-		http.Error(w, "Bad Request: Invalid JSON format", http.StatusBadRequest)
+		var syntaxError *json.SyntaxError
+		var unmarshalTypeError *json.UnmarshalTypeError
+		var maxBytesError *http.MaxBytesError // Check for body too large
+
+		switch {
+		case errors.As(err, &syntaxError):
+			msg := fmt.Sprintf("Request body contains badly-formed JSON (at character %d)", syntaxError.Offset)
+			http.Error(w, msg, http.StatusBadRequest)
+		case errors.Is(err, io.ErrUnexpectedEOF):
+			http.Error(w, "Request body contains badly-formed JSON", http.StatusBadRequest)
+		case errors.As(err, &unmarshalTypeError):
+			msg := fmt.Sprintf("Request body contains an invalid value for the %q field (at character %d)", unmarshalTypeError.Field, unmarshalTypeError.Offset)
+			http.Error(w, msg, http.StatusBadRequest)
+		case strings.HasPrefix(err.Error(), "json: unknown field "):
+			fieldName := strings.TrimPrefix(err.Error(), "json: unknown field ")
+			msg := fmt.Sprintf("Request body contains unknown field %s", fieldName)
+			http.Error(w, msg, http.StatusBadRequest)
+		case errors.Is(err, io.EOF): // Empty body
+			http.Error(w, "Request body must not be empty", http.StatusBadRequest)
+		case errors.As(err, &maxBytesError):
+			http.Error(w, "Request body must not be larger than 1MB", http.StatusRequestEntityTooLarge)
+		default: // Catch-all for other decoding errors
+			log.Printf("Error decoding JSON body: %v", err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError) // Keep internal errors internal
+		}
 		return
 	}
 
-	// Input is implicitly sanitized against XSS *here* because we are treating
-	// Name and Quantity as plain text data for the DB.
-	// SQL injection is prevented by using parameterized queries in `addItem`.
-	// XSS prevention is primarily needed when *rendering* this data back into HTML.
-	// The frontend's escapeHtml function handles display-side XSS.
-
+	// Input validation is handled within addItem
 	addedItem, err := addItem(r.Context(), newItem)
 	if err != nil {
 		log.Printf("Error adding item: %v", err)
-		// Check for specific errors if needed (e.g., validation error vs db error)
 		if strings.Contains(err.Error(), "cannot be empty") {
 			http.Error(w, fmt.Sprintf("Bad Request: %v", err), http.StatusBadRequest)
 		} else {
+			// Other DB errors are internal
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		}
 		return
@@ -249,22 +308,9 @@ func addItemHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func deleteItemHandler(w http.ResponseWriter, r *http.Request) {
-	// Extract ID from URL path like /api/items/123
-	pathParts := strings.Split(r.URL.Path, "/")
-	if len(pathParts) < 3 || pathParts[len(pathParts)-1] == "" {
-		http.Error(w, "Bad Request: Missing item ID in URL", http.StatusBadRequest)
-		return
-	}
-	idStr := pathParts[len(pathParts)-1]
-
-	id, err := strconv.Atoi(idStr)
-	if err != nil || id <= 0 {
-		http.Error(w, "Bad Request: Invalid item ID", http.StatusBadRequest)
-		return
-	}
-
-	err = deleteItem(r.Context(), id)
+// deleteItemHandler now receives the parsed ID
+func deleteItemHandler(w http.ResponseWriter, r *http.Request, id int) {
+	err := deleteItem(r.Context(), id)
 	if err != nil {
 		log.Printf("Error deleting item %d: %v", id, err)
 		if strings.Contains(err.Error(), "not found") {
@@ -282,34 +328,39 @@ func deleteItemHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	// Optional: Load .env file for local development
-	// In production (Docker), rely on environment variables set in docker-compose.yml
 	if os.Getenv("APP_ENV") != "production" {
-		err := godotenv.Load() // Load .env file from current directory
+		err := godotenv.Load()
 		if err != nil {
-			log.Println("No .env file found, proceeding with environment variables")
+			log.Println("No .env file found or error loading, proceeding with environment variables")
 		}
 	}
 
 	// Database Configuration from Environment Variables
 	dbPort, _ := strconv.Atoi(getenv("DB_PORT", "5432"))
 	dbConfig := DBConfig{
-		Host:     getenv("DB_HOST", "db"), // 'db' is the service name in docker-compose
+		Host:     getenv("DB_HOST", "db"),
 		Port:     dbPort,
 		User:     getenv("DB_USER", "user"),
 		Password: getenv("DB_PASSWORD", "password"),
 		DBName:   getenv("DB_NAME", "shoppingdb"),
-		SSLMode:  getenv("DB_SSLMODE", "disable"), // Use "require" or others if needed
+		SSLMode:  getenv("DB_SSLMODE", "disable"),
 	}
 
 	// Connect to Database and setup pooling
-	var err error
-	dbpool, err = connectDB(dbConfig)
+	// pool is the concrete *pgxpool.Pool type
+	pool, err := connectDB(dbConfig)
 	if err != nil {
 		log.Fatalf("Could not connect to the database: %v", err)
 	}
-	defer dbpool.Close() // Ensure pool is closed on application exit
+	// Assign the concrete pool to the global DBPool interface variable.
+	// This works because *pgxpool.Pool implements the DBPool interface.
+	dbpool = pool
+	// VERY IMPORTANT: Defer Close() on the CONCRETE pool object returned by connectDB.
+	// If you defer dbpool.Close(), it might work, but it's less explicit.
+	// Closing the concrete pool handles the actual resource cleanup.
+	defer pool.Close()
 
-	// Create Schema if it doesn't exist
+	// Create Schema if it doesn't exist, using the interface variable
 	if err := createSchemaIfNotExists(dbpool); err != nil {
 		log.Fatalf("Could not create database schema: %v", err)
 	}
@@ -318,13 +369,14 @@ func main() {
 	mux := http.NewServeMux()
 
 	// API Routes
-	// Note: Nginx will handle CORS headers based on nginx.conf
 	mux.HandleFunc("/items", itemsHandler)       // Handles GET /items, POST /items
 	mux.HandleFunc("/items/", itemDetailHandler) // Handles DELETE /items/{id}
 
-	// Health Check endpoint (optional but good practice)
+	// Health Check endpoint
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		// Use the global dbpool (interface) for pinging
 		if err := dbpool.Ping(r.Context()); err != nil {
+			log.Printf("Health check failed: %v", err) // Log the specific error
 			http.Error(w, "Database connection failed", http.StatusServiceUnavailable)
 			return
 		}
@@ -339,13 +391,13 @@ func main() {
 
 	server := &http.Server{
 		Addr:         serverAddr,
-		Handler:      mux, // Use our mux
+		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("Could not listen on %s: %v\n", serverAddr, err)
 	}
 }

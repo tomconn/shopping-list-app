@@ -14,6 +14,11 @@ RUN go mod download && go mod verify
 # Copy the source code into the container
 COPY . .
 
+# Run unit tests
+# The build will fail here if any tests fail.
+# Use -v for verbose output, helpful for debugging build failures.
+RUN go test -v ./...
+
 # Build the Go app - static build if possible, disable CGO
 # -ldflags="-w -s" strips debug symbols and reduces binary size
 # CGO_ENABLED=0 ensures a static build without C dependencies (good for Alpine)
