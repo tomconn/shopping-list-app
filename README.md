@@ -58,6 +58,7 @@ shopping-list-app/
 │   └── nginx.conf          # Nginx configuration for serving frontend and proxying API
 ├── docker-compose.yml      # Docker Compose file to orchestrate containers
 └── README.md               # This documentation file
+```
 
 ## Prerequisites
 
