@@ -115,7 +115,7 @@ function escapeHtml(unsafe) {
          .replace(/</g, "<")
          .replace(/>/g, ">")
          .replace(/"/g, "&quot;")
-         .replace(/'/g, "'");
+         .replace(/'/g, "&#39;");
  }
 
 // --- Initial Load ---
